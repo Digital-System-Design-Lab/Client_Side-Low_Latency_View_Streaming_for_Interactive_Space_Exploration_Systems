@@ -1,0 +1,5 @@
+===============S U M M A R Y===============
+Average e2e delay:	80.214
+Hit rate:	0.913
+Miss rate:	0.087
+Request count:	17

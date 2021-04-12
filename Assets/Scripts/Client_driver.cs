@@ -19,31 +19,17 @@ using System.Diagnostics;
 
 public class Client_driver : MonoBehaviour
 {
-    
-
     #region Network variables
-    [Header("Network Information")]
-    public int Pos_port = 12000;
-    public string Texture_server_IP = "192.168.0.2";
-    int BANDWIDTH = 50;
-    int Mega = 100000;
-
-    //private string Texture_server_IP = "165.246.39.163";
-    //private string Texture_server_IP = "116.34.184.61";
-    [Header("Server to Client port number")]
-    public int Texture_port = 11000;
+    [Header("Enter the server ip address and port for connection")]
+    public string ContentServerIP = "165.246.39.163";
+    public int ContentServerPort = 11000;
 
     [Header("Must be the same in sender and receiver")]
     public int messageByteLength = 24;
     byte[] frameBytesLength;
 
-    TcpClient posClient = null;
-    TcpClient texClient = null;
-    TcpListener posServer = null;
-
-    NetworkStream pos_stream = null;
-    NetworkStream tex_stream = null;
-
+    TcpClient tcpclient = null;
+    NetworkStream stream = null; //bi-directional stream
     byte[] posBytes;
     byte[] infoBytes;
     #endregion
@@ -54,15 +40,12 @@ public class Client_driver : MonoBehaviour
     Loc cur_loc;
     Loc prev_loc;
     out_cache_search cur_result;
-    DataPacket requestPacket;
-
     Request packet;
     Client_info client_info;
     #endregion
 
     #region 기타 변수들
     int time = 0;
-    int sync = 0;
     public List<SubRange> range;
     Point2D[] predict_p;
     Velocity velo;
@@ -71,17 +54,18 @@ public class Client_driver : MonoBehaviour
     int prev_seg_y;
 
     bool skip = false;
-    int receive_num;
 
-    double e2eDelay = 0.0f;
-    Stopwatch sw;
-    Stopwatch sw1;
+    Stopwatch total_sw;
+    Stopwatch bufferRead;
+
+    int sumOfBufferRead;
+    int sumOfViewRead;
+    int[] target_delay;
     #endregion
 
     #region 수행시간 측정 변수들
     DateTime end2end;
-
-
+    Profiler profiler;
     #endregion
 
     #region 클래스 변수들
@@ -90,7 +74,6 @@ public class Client_driver : MonoBehaviour
     ESASinfo esasinfo;
     viewinfo view_info;
     ISESESAS.Path path;
-    Profiler profiler;
     Qualitylist misslist;
     #endregion
 
@@ -105,15 +88,12 @@ public class Client_driver : MonoBehaviour
 
     #region Thread 관련 변수
     Thread partial_rendering;
-    Thread receiveThread;
-
     Thread[] receiveThreads;
     Thread renderingThread;
 
     object[] receiveLocks;
     object[] partialLocks;
     object receivelock;
-    object renderlock;
     #endregion
 
     #region Unity 변수
@@ -121,6 +101,8 @@ public class Client_driver : MonoBehaviour
     public GameObject Equi = null;
     Texture2D tex;
     #endregion
+
+
     // Start is called before the first frame update
     void Start()
     {
@@ -129,85 +111,117 @@ public class Client_driver : MonoBehaviour
         init_Unity();
         init_Thread();
         EstablishConn();
-        //shareClientInfo();
-        sw = new Stopwatch();
-        sw1 = new Stopwatch();
+        shareClientInfo();
     }
 
+    // Update is called once per frame
+    void Update()
+    {
+#if true
+        List<Labelinfo> label_delay = new List<Labelinfo>();
+        total_sw.Start();
+        #region Request a view
+        profiler.Start("getPos");
+        getPos(time);                           // 정해진 scenario가 아닌 컨트롤러, 키보드를 인터페이스로 지정하려면 해당 함수 수정해야 한다.
+        label_delay.Add(profiler.End());
+
+        profiler.Start("Packetize");
+        packetize();
+        label_delay.Add(profiler.End());
+
+        // 새로운 sub-segment에 위치하고 cache hit가 아닌 경우 서버로부터 sub-segment 데이터 요청
+        if (!_isSameSeg() && cur_result.getStat() != CacheStatus.HIT)
+        {
+            profiler.Start("sendPacket");
+            send_Packet();                          // Request Packet 전송
+            label_delay.Add(profiler.End());
+
+            skip = true;
+            #region Receive a view
+            // 만약 partial hit의 경우 miss난 sub-view set을 요청과 함께 background로 cache에 있는 sub-view decoding & up-sampling 작업 진행
+            if (cur_result.getStat() == CacheStatus.PARTIAL_HIT)
+            {
+                profiler.Start("partialRendering");
+                partialRendering();
+                label_delay.Add(profiler.End()); 
+            }
+            // 서버로부터 miss난 sub-view set 요청
+            profiler.Start("receive_subseg");
+            receive_subseg();
+            label_delay.Add(profiler.End());
+
+            
+            #endregion
+        }
+        #endregion
+
+        #region Rendering(decode&up-sampling -> apply texture)
+        //sub-segment의 첫 번째 view는 rendering 생략
+        if (skip)
+        {
+            profiler.Start("Rendering_Skip");
+            tex.Apply();
+            skip = false;
+            label_delay.Add(profiler.End());
+        }
+        else
+        {
+            profiler.Start("Rendering");
+            Renderings();
+            label_delay.Add(profiler.End());
+
+        }
+        #endregion
+        if (time == client.pathlist.Length)     // Scenario가 모두 끝났다면 종료
+        {
+            EditorApplication.isPlaying = false;
+        }
+        time++;
+
+
+        profiler.Start("recordPrevPacket");
+        client.cache.recordPrevPacket(packet);
+        client.cache.recordPrevPacket(cur_pos, cur_result, cur_loc);
+        label_delay.Add(profiler.End());
+
+        prev_loc = cur_loc;
+        total_sw.Stop();
+
+        // 일정한 End to end latency를 위해 target latency보다 빠르게 수행됐다면 idle 상태로 조절
+        if (total_sw.ElapsedMilliseconds < target_delay[cur_pos.getEslevel()])
+        {
+            profiler.Start("idle");
+            Thread.Sleep(target_delay[cur_pos.getEslevel()] - (int)total_sw.ElapsedMilliseconds);
+            label_delay.Add(profiler.End());
+        }
+        total_sw.Reset();
+
+        //profiler에 기록
+        profiler.recording(label_delay, cur_pos, cur_result, cur_loc);
+        profiler.recordLabel(label_delay);
+#endif
+    }
+
+    #region Initalization methods
+    /// <summary>
+    /// 클라이언트 정보를 서버에게 전달을 하여 sub-segment 크기를 공유
+    /// </summary>
     public void shareClientInfo()
     {
         frameBytesLength = new byte[messageByteLength];
         infoBytes = StructToBytes(client_info);
 
         byteLengthToFrameByteArray(infoBytes.Length, frameBytesLength);
-        posClient.NoDelay = true;
-        posClient.SendBufferSize = frameBytesLength.Length;
-        NetworkStream pos_stream = posClient.GetStream();
+        tcpclient.NoDelay = true;
+        tcpclient.Client.NoDelay = true;
+        tcpclient.SendBufferSize = frameBytesLength.Length;
+        NetworkStream pos_stream = tcpclient.GetStream();
         pos_stream.Write(frameBytesLength, 0, frameBytesLength.Length);
-        posClient.NoDelay = true;
-        posClient.SendBufferSize = infoBytes.Length;
-        NetworkStream pos_stream1 = posClient.GetStream();
-        pos_stream1.Write(infoBytes, 0, infoBytes.Length);
+        pos_stream.Write(infoBytes, 0, infoBytes.Length);
     }
-
-    // Update is called once per frame
-    void Update()
-    {
-#if false
-        #region Request a view
-        DateTime Start = DateTime.Now;
-        getPos(time);
-        packetize();
-        if(!_isSameSeg() && cur_result.getStat() != CacheStatus.HIT)
-        {
-            send_Packet();
-            skip = true;
-            #region Receive a view
-            if (cur_result.getStat() == CacheStatus.PARTIAL_HIT)
-            {
-                partialRendering();
-            }
-            receive_subseg();
-        #endregion
-        }
-        #endregion
-        
-        #region Rendering(decode&up-sampling -> apply texture)
-        if (skip)
-        {
-            tex.Apply();
-            skip = false;
-        }
-        else
-        {
-            sw1.Start();
-            Renderings();
-            sw1.Stop();
-            UnityEngine.Debug.LogFormat("Rendering time : {0}", sw1.ElapsedMilliseconds);
-            sw1.Reset();
-        }
-        #endregion
-        e2eDelay += (DateTime.Now - Start).TotalMilliseconds;
-        if (time == client.pathlist.Length)
-        {
-            EditorApplication.isPlaying = false;
-        }
-        time++;
-        client.cache.recordPrevPacket(packet);
-        prev_loc = cur_loc;
-#endif
-    }
-
-    void waitThreads()
-    {
-        for(int i = 0; i < receiveLocks.Length; i++)
-        {
-            receiveThreads[i].Join();
-        }
-        //receiveThread.Join();
-        UnityEngine.Debug.LogError("Wait for receiveThreads");
-    }
-
+    /// <summary>
+    /// Thread 선언 및 lock 객체 선언 
+    /// </summary>
     void init_Thread()
     {
         receiveThreads = new Thread[client.cache.cacheinfo.seg_size];
@@ -221,29 +235,36 @@ public class Client_driver : MonoBehaviour
             partialLocks[i] = temp1;
         }
         receivelock = new object();
-        renderlock = new object();
     }
+
+    /// <summary>
+    /// Class 와 Struct 변수 초기화 함수
+    /// </summary>
     void init_ClassandStruct()
     {
-        receive_num = 0;
-        int one_way_length =480;
-        double percentage = 0.5f;
+        int one_way_length = 5520;
+        double percentage = 0.8f;
         int cachesize = (int)((double)(one_way_length) * percentage);
-        client = new Client();
-        profiler = new Profiler();
+        client = new Client();                                                          //클라이언트 객체 생성 
+        profiler = new Profiler();                                                      //수행시간 분석을 위한 Profiler 객체 생성
         view_info = new viewinfo(2048, 4096, 3);
-        int seg_size = 30;
-        cacheinfo = new Cacheinfo(cachesize, seg_size, 720, 6720, Policy.LRU, 10);
+        int seg_size = 12;
+        cacheinfo = new Cacheinfo(cachesize, seg_size, 720, 6720, Policy.GDC, 10);
         esasinfo = new ESASinfo(6, 0.3f, 0.6f);
         client.init(cacheinfo, esasinfo, view_info);
-        client.read_path("Simple_circle.txt");
+        client.read_path("Worst_cycle.txt");                                            //벤치마킹을 위한 walking scenario
         framebuffer = new byte[view_info.width * view_info.height * view_info.bpp];
         range = calcSubrange(seg_size);
         cur_result = new out_cache_search();
         client_info = new Client_info(seg_size, client.pathlist.Length);
         prev_seg_x = -1;
         prev_seg_y = -1;
-        
+        total_sw = new Stopwatch();
+        bufferRead = new Stopwatch();
+        target_delay = new int[3];
+        target_delay[0] = 33; // Slow 33ms
+        target_delay[1] = 20; // Fast 20ms
+        target_delay[2] = 15; // SuperFast 15ms
     }
     void init_Unity()
     {
@@ -253,43 +274,122 @@ public class Client_driver : MonoBehaviour
         Equi.GetComponent<Renderer>().enabled = true;
         Render_tex.GetComponent<Renderer>().material.shader = Shader.Find("Unlit/Pano360Shader");
         Equi.GetComponent<Renderer>().material.shader = Shader.Find("Unlit/Pano360Shader");
-        tex = new Texture2D(view_info.width, view_info.height, TextureFormat.RGB24, false);
+        tex = new Texture2D(view_info.width, view_info.height, TextureFormat.RGB24, false);         //생성할 view의 해상도로 Texture를 설정. 만약, 그렇게하지 않으면 apply 속도가 추가적으로 발생
         Render_tex.GetComponent<Renderer>().material.mainTexture = tex;
         Equi.GetComponent<Renderer>().material.mainTexture = tex;
     }
-    public void dodelay(float target_delay)
+
+    #endregion
+
+    #region Rendering methods
+    void RenderingView(int iter, int index)
     {
-        //DateTime temp = DateTime.Now;
-        //float excution_time = 0.0f;
-        //while (target_delay > excution_time)
-        //{
-        //    excution_time = (DateTime.Now - temp).Milliseconds;
-        //}
-        Thread.Sleep((int)target_delay);
-        //Task.Delay((int)target_delay);
-        //UnityEngine.Debug.LogWarningFormat("Delay time : {0:f3}", excution_time);
-    }
-    public void dodelay(int target_delay)
-    {
-        //DateTime temp = DateTime.Now;
-        //float excution_time = 0.0f;
-        //while (target_delay > excution_time)
-        //{
-        //    excution_time = (DateTime.Now - temp).Milliseconds;
-        //}
-        Task.Delay((int)target_delay);
-        //UnityEngine.Debug.LogWarningFormat("Delay time : {0:f3}", excution_time);
-    }
-    public void letidlestat(float target_delay)
-    {
-        DateTime temp = DateTime.Now;
-        float excution_time = 0.0f;
-        while (target_delay > excution_time)
+        int temp = iter;
+        int idx = index;
+        //Partial rendering과 receive thread가 수행되지 않았다면 기다렸다가 rendering하기 위해 lock을 이용
+        if (cur_result.getStat() != CacheStatus.PARTIAL_HIT)
         {
-            excution_time = (DateTime.Now - temp).Milliseconds;
+            lock (receiveLocks[temp])
+            {
+                client.rendersubviews(client.cache.table[idx].getlview(temp),
+                    client.cache.table[idx].getfview(temp),
+                    client.cache.table[idx].getrview(temp),
+                    client.cache.table[idx].getbview(temp),
+                    cur_result.getRenderlist());
+            }
         }
-        //UnityEngine.Debug.LogWarningFormat("Delay time : {0:f3}", excution_time);
+        else
+        {
+            lock (receiveLocks[temp])
+            {
+                lock (partialLocks[temp])
+                {
+                    client.renderPartialsubviews(client.cache.table[idx].getlview(temp),
+                        client.cache.table[idx].getfview(temp),
+                        client.cache.table[idx].getrview(temp),
+                        client.cache.table[idx].getbview(temp),
+                        cur_result.getMisslist(),
+                        cur_result.getHitlist(),
+                        temp);
+                }
+            }
+        }
     }
+
+
+    void partialRendering()
+    {
+        partial_rendering = new Thread(() =>
+        {
+            int idx = cur_result.getIdx();
+            int start = 0;
+            int end = 0;
+            bool reverse = false;
+            int iter = cur_loc.iter;
+
+            // 정방향인지 역방향인지 판별
+            if (iter == 0)
+            {
+                start = 0; end = client.cache.cacheinfo.seg_size;
+                reverse = false;
+            }
+            else if (iter == client.cache.cacheinfo.seg_size - 1)
+            {
+                start = client.cache.cacheinfo.seg_size - 1; end = 0;
+                reverse = true;
+            }
+
+            // Cache에 있는 sub-view에 대해 background에서 rendering 수행
+            if (!reverse)
+            {
+                for (int i = start; i < end; i++)
+                {
+                    lock (partialLocks[i])
+                    {
+                        client.rendersubviews(client.cache.table[idx].getlview(i),
+                            client.cache.table[idx].getfview(i),
+                            client.cache.table[idx].getrview(i),
+                            client.cache.table[idx].getbview(i),
+                            cur_result.getHitlist(), i);
+                    }
+                }
+            }
+            else
+            {
+                for (int i = start; i >= end; i--)
+                {
+                    lock (partialLocks[i])
+                    {
+                        client.rendersubviews(client.cache.table[idx].getlview(i),
+                            client.cache.table[idx].getfview(i),
+                            client.cache.table[idx].getrview(i),
+                            client.cache.table[idx].getbview(i),
+                            cur_result.getHitlist(), i);
+                    }
+                }
+            }
+
+
+        });
+        partial_rendering.IsBackground = true;
+        partial_rendering.Start();
+    }
+    void Renderings()
+    {
+        int iter = cur_loc.iter;
+        int idx = cur_result.getIdx();
+        renderingThread = new Thread(() => RenderingView(iter, idx));       // sub-view를 하나의 frame image로 rendering
+        renderingThread.IsBackground = true;
+        renderingThread.Start();
+        renderingThread.Join();
+
+        // Texture2D 데이터에 frame을 입히는 작업
+        tex.LoadRawTextureData(client.render_frame());
+        tex.Apply();
+    }
+    #endregion
+
+    #region 기타 methods
     public bool _isSameSeg()
     {
         if ((prev_seg_x == cur_loc.get_seg_pos().seg_pos_x) && (prev_seg_y == cur_loc.get_seg_pos().seg_pos_y))
@@ -310,30 +410,37 @@ public class Client_driver : MonoBehaviour
     }
     void packetize()
     {
-        int hd = client.getHeadDirection(cur_path.hd);
-        int esl = client.calcESL(cur_path);
-        esl = 0;
-        string reqlist = client.getReqViewlist(esl, hd);
+        int hd = client.getHeadDirection(cur_path.hd);                              //0~360도 head direction을 0~3의 head direction으로 변환
+        int esl = client.calcESL(cur_path);                                         //Exploring Speed Level (ESL)인 Slow, Fast, Super-fast를 각각 0, 1, 2로 변환
+        string reqlist = client.getReqViewlist(esl, hd);                            //esl과 hd에 따른 필요한 sub-view list를 string으로 반환 예) 0222 -> (LEFT=0)(FRONT=2)(RIGHT=2)(BACK=2) 0은 전송하지 않고 1은 Down-sampled, 2는 Original sub-view를 의미
         cur_pos = new Pos(cur_path.x, cur_path.y, hd, esl);
-        cur_loc = TransP2L();
-        
-        client.CacheTableUpdate(packet, cur_loc, reqlist, time, ref cur_result);
-        misslist.convertSTR2LIST(cur_result.getMisslist());
-        packet = new Request(cur_pos, misslist, cur_loc.get_seg_pos());
+        cur_loc = TransP2L();                                                       //가상공간의 위치인 Loc으로  변환
 
+        client.CacheTableUpdate(packet, cur_loc, reqlist, time, ref cur_result);    //Cache Table update
+        misslist.convertSTR2LIST(cur_result.getMisslist());                         //network 전송을 위해 List로 변환
+        packet = new Request(cur_pos, misslist, cur_loc.get_seg_pos());             //Request 패킷 변환
+
+        // Dead Reckoning 인 경우 prediction 진행
+        int isPredict = 0;
         if (client.cache.cacheinfo.policy == Policy.DR)
         {
+
             if (time == 0)
             {
-                velo = client.cache.calcVelocity(packet, cur_loc);
+                velo = new Velocity(0.0f, 0.0f);
             }
             else
             {
                 velo = client.cache.calcVelocity(packet, prev_loc);
-
             }
-            prediction();
+            if (!prediction())
+            {
+                isPredict = 1;
+            }
         }
+        // Prediction 결과 packet에 초기화
+        packet.isPredicted = isPredict;
+
     }
     public Loc TransP2L()
     {
@@ -370,12 +477,24 @@ public class Client_driver : MonoBehaviour
 
         return loc;
     }
-
-    public void prediction()
+    public List<SubRange> calcSubrange(int seg_size)
+    {
+        List<SubRange> subrange = new List<SubRange>();
+        int numOfrange = 120 / seg_size;
+        for (int iter = 0; iter < numOfrange; iter++)
+        {
+            int start = seg_size * (iter);
+            int end = seg_size * (iter + 1) - 1;
+            SubRange range = new SubRange(start, end);
+            subrange.Add(range);
+        }
+        return subrange;
+    }
+    public bool prediction()
     {
         bool isPredict = true;
         bool isPartial = false;
-        if(time!=0 && time!=(client.pathlist.Length - 1))
+        if (time != 0 && time != (client.pathlist.Length - 1))
         {
             if (cur_pos.getHead_dir() == 1 || cur_pos.getHead_dir() == 2)
             {
@@ -383,8 +502,11 @@ public class Client_driver : MonoBehaviour
                 {
                     //prediction을 한다.
                     predict_p = client.cache.predictPos(packet, velo);
-                    UnityEngine.Debug.LogWarningFormat("{0} {1} {2} {3} predicted position", predict_p[0].getX(), predict_p[0].getY(),
-                        predict_p[1].getX(), predict_p[1].getY());
+                    for (int i = 0; i < 10; i++)
+                    {
+                        UnityEngine.Debug.LogWarningFormat("{0} {1} predicted position", predict_p[i].getX(), predict_p[i].getY());
+                    }
+
                 }
                 else if (cur_loc.iter == 0)
                 {
@@ -428,175 +550,22 @@ public class Client_driver : MonoBehaviour
                 UnityEngine.Debug.LogError("Prediction 실패!");
             }
         }
-    }
-    void send_Packet()
-    {
-        frameBytesLength = new byte[messageByteLength];
-        posBytes = packet.StructToBytes(packet);
 
-        byteLengthToFrameByteArray(posBytes.Length, frameBytesLength);
-        posClient.NoDelay = true;   
-        posClient.SendBufferSize = frameBytesLength.Length;
-        NetworkStream pos_stream = posClient.GetStream();
-        pos_stream.Write(frameBytesLength, 0, frameBytesLength.Length);
-        posClient.NoDelay = true;
-        posClient.SendBufferSize = posBytes.Length;
-        NetworkStream pos_stream1 = posClient.GetStream();
-        pos_stream1.Write(posBytes, 0, posBytes.Length);
+        return isPredict;
     }
-    void receive_view()
-    {
-        int viewsize = readPosByteSize(messageByteLength);
-        readFrameByteArray(viewsize);
-    }
-    void receive_views()
-    {
-        if (packet.misslist.Left != QUALITY.EMPTY)
-        {
-            int viewsize = readPosByteSize(messageByteLength);
-            readFrameByteArray(viewsize);
-            Lsubview = jpegBytes;
-        }
-        if (packet.misslist.Front != QUALITY.EMPTY)
-        {
-            int viewsize = readPosByteSize(messageByteLength);
-            readFrameByteArray(viewsize);
-            Fsubview = jpegBytes;
-        }
-        if (packet.misslist.Right != QUALITY.EMPTY)
-        {
-            int viewsize = readPosByteSize(messageByteLength);
-            readFrameByteArray(viewsize);
-            Rsubview = jpegBytes;
-        }
-        if (packet.misslist.Back != QUALITY.EMPTY)
-        {
-            int viewsize = readPosByteSize(messageByteLength);
-            readFrameByteArray(viewsize);
-            Bsubview = jpegBytes;
-        }
-    }
-#if false
-    #region backUp
-    void receive_subseg()
-    {
-        int idx = cur_result.getIdx();
-        receiveTask = new Thread(() =>
-        {
-            receive_num = 0;
-            Request _packet = packet;
-            for (int i = 0; i < client.cache.cacheinfo.seg_size; i++)
-            {
-                DateTime start = DateTime.Now;
-                if (_packet.misslist.Left != QUALITY.EMPTY)
-                {
-                    int viewsize = readPosByteSize(messageByteLength);
-                    readFrameLeft(viewsize);
-                    client.cache.table[idx].setlView(i, Lsubview);
-                }
-                if (_packet.misslist.Front != QUALITY.EMPTY)
-                {
-                    int viewsize = readPosByteSize(messageByteLength);
-                    readFrameFront(viewsize);
-                    client.cache.table[idx].setfView(i, Fsubview);
-                    UnityEngine.Debug.Log(viewsize + " is viewsize");
-                }
-                if (_packet.misslist.Right != QUALITY.EMPTY)
-                {
-                    int viewsize = readPosByteSize(messageByteLength);
-                    readFrameRight(viewsize);
-                    client.cache.table[idx].setrView(i, Rsubview);
-                }
-                if (_packet.misslist.Back != QUALITY.EMPTY)
-                {
-                    int viewsize = readPosByteSize(messageByteLength);
-                    readFrameBack(viewsize);
-                    client.cache.table[idx].setbView(i, Bsubview);
-                }
-                receive_num += 1;
-                UnityEngine.Debug.LogFormat("{0} 번째 view 수신 완료 {1:f3}  misslist : {2}", i, (DateTime.Now - start).TotalMilliseconds, _packet.misslist.Front.ToString());
-            }
-        });
-        receiveTask.Start();
-    }
-
     #endregion
-#endif
-    void RenderingView(int iter, int index)
-    {
-        int temp = iter;
-        int idx = index;
-        if (cur_result.getStat() != CacheStatus.PARTIAL_HIT)
-        {
-            lock (receiveLocks[temp])
-            {
-                client.rendersubviews(client.cache.table[idx].getlview(temp),
-                    client.cache.table[idx].getfview(temp),
-                    client.cache.table[idx].getrview(temp),
-                    client.cache.table[idx].getbview(temp),
-                    cur_result.getRenderlist());
-            }
-        }
-        else
-        {
-            lock (partialLocks[temp])
-            {
-                client.renderPartialsubviews(client.cache.table[idx].getlview(temp),
-                    client.cache.table[idx].getfview(temp),
-                    client.cache.table[idx].getrview(temp),
-                    client.cache.table[idx].getbview(temp),
-                    cur_result.getMisslist(),
-                    cur_result.getHitlist(),
-                    temp);
-            }
-        }
-    }
-    void receive_subseg()
-    {
-        int index = cur_result.getIdx();
-        Request _packet = packet;
 
-        bool reverse = false;
-        UnityEngine.Debug.LogWarning("iter " + cur_loc.iter);
-        if (cur_loc.iter == 0)
-        {
-            reverse = false;
-        }
-        else if(cur_loc.iter == client.cache.cacheinfo.seg_size - 1)
-        {
-            reverse = true;
-        }
-        if (!reverse)
-        {
-            for (int i = 0; i < receiveThreads.Length; i++)
-            {
-                int iter = i;
-                receiveThreads[iter] = new Thread(() => ReceiveView(_packet, index, iter));
-                receiveThreads[iter].IsBackground = true;
-                receiveThreads[iter].Start();
-            }
-        }
-        else
-        {
-            for (int i = receiveThreads.Length-1; i >= 0; i--)
-            {
-                int iter = i;
-                receiveThreads[iter] = new Thread(() => ReceiveView(_packet, index, iter));
-                receiveThreads[iter].IsBackground = true;
-                receiveThreads[iter].Start();
-            }
-        }
-    }
-    
+    #region Network methods
     void ReceiveView(Request _packet, int idx, int i)
     {
+        // sub-segment size 만큼 recevie한다. 단, cache 저장될 때 순서에 유의해야하기 때문에 thread lock을 이용하여 통제
         lock (receiveLocks[i])
         {
             lock (receivelock)
             {
                 int total = 0;
-                sw.Start();
                 int num = readPosByteSize(messageByteLength);
+                //int num = i;
                 if (_packet.misslist.Left != QUALITY.EMPTY)
                 {
                     int viewsize = readPosByteSize(messageByteLength);
@@ -625,153 +594,74 @@ public class Client_driver : MonoBehaviour
                     readFrameBack(viewsize);
                     client.cache.table[idx].setbView(num, Bsubview);
                 }
-                sw.Stop();
-                UnityEngine.Debug.LogWarningFormat("Receive view time : {0},  {1}", sw.ElapsedMilliseconds,total);
-                sw.Reset();
             }
         }
     }
-
-    void receive_subseg_pending()
+    void receive_subseg()
     {
-        int idx = cur_result.getIdx();
-        for (int i = 0; i < client.cache.cacheinfo.seg_size; i++)
+        int index = cur_result.getIdx();
+        Request _packet = packet;
+
+        bool reverse = false;
+        if (cur_loc.iter == 0)
         {
-            DateTime start = DateTime.Now;
-            if (packet.misslist.Left != QUALITY.EMPTY)
+            reverse = false;
+        }
+        else if (cur_loc.iter == client.cache.cacheinfo.seg_size - 1)
+        {
+            reverse = true;
+        }
+
+        // 서버로부터 요청한 sub-segment 데이터 수신
+        if (!reverse)
+        {
+            for (int i = 0; i < receiveThreads.Length; i++)
             {
-                int viewsize = readPosByteSize(messageByteLength);
-                readFrameByteArray(viewsize);
-                client.cache.table[idx].setlView(i, jpegBytes);
+                int iter = i;
+                receiveThreads[iter] = new Thread(() => ReceiveView(_packet, index, iter));
+                receiveThreads[iter].IsBackground = true;
+                receiveThreads[iter].Start();
             }
-            if (packet.misslist.Front != QUALITY.EMPTY)
+        }
+        else
+        {
+            for (int i = receiveThreads.Length - 1; i >= 0; i--)
             {
-                int viewsize = readPosByteSize(messageByteLength);
-                readFrameByteArray(viewsize);
-                client.cache.table[idx].setfView(i, jpegBytes);
-                UnityEngine.Debug.Log(viewsize + " is viewsize");
+                int iter = i;
+                receiveThreads[iter] = new Thread(() => ReceiveView(_packet, index, iter));
+                receiveThreads[iter].IsBackground = true;
+                receiveThreads[iter].Start();
             }
-            if (packet.misslist.Right != QUALITY.EMPTY)
-            {
-                int viewsize = readPosByteSize(messageByteLength);
-                readFrameByteArray(viewsize);
-                client.cache.table[idx].setrView(i, jpegBytes);
-            }
-            if (packet.misslist.Back != QUALITY.EMPTY)
-            {
-                int viewsize = readPosByteSize(messageByteLength);
-                readFrameByteArray(viewsize);
-                client.cache.table[idx].setbView(i, jpegBytes);
-            }
-            UnityEngine.Debug.LogFormat("{0} 번째 view 수신 완료 {1:f3}  misslist : {2}", i, (DateTime.Now - start).TotalMilliseconds, packet.misslist.createStringType());
         }
     }
+    void send_Packet()
+    {
+        frameBytesLength = new byte[messageByteLength];
+        posBytes = packet.StructToBytes(packet);
 
-    void Rendering()
-    {
-        int err = Client.decoding(jpegBytes, framebuffer, jpegBytes.Length, view_info.width, view_info.height, view_info.bpp);
-        tex.LoadRawTextureData(framebuffer);
-        tex.Apply();
+        byteLengthToFrameByteArray(posBytes.Length, frameBytesLength);
+        tcpclient.NoDelay = true;
+        tcpclient.Client.NoDelay = true;
+        tcpclient.SendBufferSize = frameBytesLength.Length;
+        NetworkStream pos_stream = tcpclient.GetStream();
+        pos_stream.Write(frameBytesLength, 0, frameBytesLength.Length);
+        pos_stream.Write(posBytes, 0, posBytes.Length);
     }
-    void partialRendering()
-    {
-        partial_rendering = new Thread(() =>
-        {
-            int idx = cur_result.getIdx();
-            int start = 0;
-            int end = 0;
-            bool reverse = false;
-            int iter = cur_loc.iter;
-            if(iter == 0)
-            {
-                start = 0; end = client.cache.cacheinfo.seg_size;
-                reverse = false;
-            }
-            else if(iter == client.cache.cacheinfo.seg_size-1)
-            {
-                start = client.cache.cacheinfo.seg_size-1; end = 0;
-                reverse = true;
-                UnityEngine.Debug.LogError("HELLO");
-                //start = 0; end = client.cache.cacheinfo.seg_size;
-                //reverse = false;
-            }
-            if (!reverse)
-            {
-                for (int i = start; i < end; i++)
-                {
-                    lock (partialLocks[i])
-                    {
-                        client.rendersubviews(client.cache.table[idx].getlview(i),
-                            client.cache.table[idx].getfview(i),
-                            client.cache.table[idx].getrview(i),
-                            client.cache.table[idx].getbview(i),
-                            cur_result.getHitlist(), i);
-                    }
-                }
-            }
-            else
-            {
-                for (int i = start; i >= end; i--)
-                {
-                    lock (partialLocks[i])
-                    {
-                        client.rendersubviews(client.cache.table[idx].getlview(i),
-                            client.cache.table[idx].getfview(i),
-                            client.cache.table[idx].getrview(i),
-                            client.cache.table[idx].getbview(i),
-                            cur_result.getHitlist(), i);
-                    }
-                }
-            }
-            
-            
-        });
-        partial_rendering.IsBackground = true;
-        partial_rendering.Start();
-    }
-    void Renderings()
-    {
-        int iter = cur_loc.iter;
-        int idx = cur_result.getIdx();
-        renderingThread = new Thread(() => RenderingView(iter, idx));
-        renderingThread.IsBackground = true;
-        renderingThread.Start();
-        renderingThread.Join();
-        
-        tex.LoadRawTextureData(client.render_frame());
-        tex.Apply();
-    }
-    private byte[] readFrameByteArray(int size)
-    {
-        bool disconnected = false;
-
-        jpegBytes = new byte[size];
-        texClient.NoDelay = true;
-        texClient.ReceiveBufferSize = size;
-        NetworkStream tex_stream = texClient.GetStream();
-        var total = 0;
-        do
-        {
-            var read = tex_stream.Read(jpegBytes, total, size - total);
-            if (read == 0)
-            {
-                disconnected = true;
-                break;
-            }
-            total += read;
-        } while (total != size);
-        return jpegBytes;
-    }
-
     private void readFrameLeft(int size)
     {
         bool disconnected = false;
 
         Lsubview = new byte[size];
-        texClient.NoDelay = true;
-        texClient.ReceiveBufferSize = size;
-        NetworkStream tex_stream = texClient.GetStream();
+        tcpclient.NoDelay = true;
+        tcpclient.Client.NoDelay = true;
+        tcpclient.ReceiveBufferSize = size;
+        NetworkStream tex_stream = tcpclient.GetStream();
         var total = 0;
+        do
+        {
+
+        } while (!tex_stream.DataAvailable);
+        bufferRead.Start();
         do
         {
             var read = tex_stream.Read(Lsubview, total, size - total);
@@ -782,16 +672,25 @@ public class Client_driver : MonoBehaviour
             }
             total += read;
         } while (total != size);
+        bufferRead.Stop();
+        sumOfBufferRead += (int)bufferRead.ElapsedMilliseconds;
+        bufferRead.Reset();
     }
     private void readFrameFront(int size)
     {
         bool disconnected = false;
 
         Fsubview = new byte[size];
-        texClient.NoDelay = true;
-        texClient.ReceiveBufferSize = size;
-        NetworkStream tex_stream = texClient.GetStream();
+        tcpclient.NoDelay = true;
+        tcpclient.Client.NoDelay = true;
+        tcpclient.ReceiveBufferSize = size;
+        NetworkStream tex_stream = tcpclient.GetStream();
         var total = 0;
+        do
+        {
+
+        } while (!tex_stream.DataAvailable);
+        bufferRead.Start();
         do
         {
             var read = tex_stream.Read(Fsubview, total, size - total);
@@ -802,16 +701,26 @@ public class Client_driver : MonoBehaviour
             }
             total += read;
         } while (total != size);
+        //UnityEngine.Debug.LogWarningFormat("Front read time : {0}", exetime.ElapsedMilliseconds);
+        bufferRead.Stop();
+        sumOfBufferRead += (int)bufferRead.ElapsedMilliseconds;
+        bufferRead.Reset();
     }
     private void readFrameRight(int size)
     {
         bool disconnected = false;
 
         Rsubview = new byte[size];
-        texClient.NoDelay = true;
-        texClient.ReceiveBufferSize = size;
-        NetworkStream tex_stream = texClient.GetStream();
+        tcpclient.NoDelay = true;
+        tcpclient.Client.NoDelay = true;
+        tcpclient.ReceiveBufferSize = size;
+        NetworkStream tex_stream = tcpclient.GetStream();
         var total = 0;
+        do
+        {
+
+        } while (!tex_stream.DataAvailable);
+        bufferRead.Start();
         do
         {
             var read = tex_stream.Read(Rsubview, total, size - total);
@@ -822,16 +731,26 @@ public class Client_driver : MonoBehaviour
             }
             total += read;
         } while (total != size);
+        //UnityEngine.Debug.LogWarningFormat("Right read time : {0}", exetime.ElapsedMilliseconds);
+        bufferRead.Stop();
+        sumOfBufferRead += (int)bufferRead.ElapsedMilliseconds;
+        bufferRead.Reset();
     }
     private void readFrameBack(int size)
     {
         bool disconnected = false;
 
         Bsubview = new byte[size];
-        texClient.NoDelay = true;
-        texClient.ReceiveBufferSize = size;
-        NetworkStream tex_stream = texClient.GetStream();
+        tcpclient.NoDelay = true;
+        tcpclient.Client.NoDelay = true;
+        tcpclient.ReceiveBufferSize = size;
+        NetworkStream tex_stream = tcpclient.GetStream();
         var total = 0;
+        do
+        {
+
+        } while (!tex_stream.DataAvailable);
+        bufferRead.Start();
         do
         {
             var read = tex_stream.Read(Bsubview, total, size - total);
@@ -842,61 +761,20 @@ public class Client_driver : MonoBehaviour
             }
             total += read;
         } while (total != size);
+        //UnityEngine.Debug.LogWarningFormat("Back read time : {0}", exetime.ElapsedMilliseconds);
+        bufferRead.Stop();
+        sumOfBufferRead += (int)bufferRead.ElapsedMilliseconds;
+        bufferRead.Reset();
     }
-    public List<SubRange> calcSubrange(int seg_size)
-    {
-        List<SubRange> subrange = new List<SubRange>();
-        int numOfrange = 120 / seg_size;
-        for (int iter = 0; iter < numOfrange; iter++)
-        {
-            int start = seg_size * (iter);
-            int end = seg_size * (iter + 1) - 1;
-            SubRange range = new SubRange(start, end);
-            subrange.Add(range);
-        }
-        return subrange;
-    }
-
-    public string GetLocalIP()
-    {
-        string localIP = "Not available, please check your network seetings!";
-        IPHostEntry host = Dns.GetHostEntry(Dns.GetHostName());
-        foreach (IPAddress ip in host.AddressList)
-        {
-            if (ip.AddressFamily == AddressFamily.InterNetwork)
-            {
-                localIP = ip.ToString();
-                break;
-            }
-        }
-        return localIP;
-    }
-
-
+    /// <summary>
+    /// Server와의 연결
+    /// </summary>
     void EstablishConn()
     {
-        #region Postional data connection
-        posServer = new TcpListener(IPAddress.Any, Pos_port);
-        posServer.Start();
-        Task serverThread = new Task(() =>
-        {
-            UnityEngine.Debug.Log("Wait for sending pos data");
-            posClient = posServer.AcceptTcpClient();
-            UnityEngine.Debug.Log("Ready for sending pos data");
-            pos_stream = posClient.GetStream();
-        });
-        serverThread.Start();
-        UnityEngine.Debug.Log("My ip : " + GetLocalIP());
-        #endregion
-
-        Thread.Sleep(2000);
-
-        #region view data connection
-        texClient = new TcpClient();
-        texClient.Connect(IPAddress.Parse(Texture_server_IP), Texture_port);
-        tex_stream = texClient.GetStream();
-        UnityEngine.Debug.Log("Ready for receiving texture data");
-        #endregion
+        tcpclient = new TcpClient();
+        tcpclient.Connect(IPAddress.Parse(ContentServerIP), ContentServerPort);
+        stream = tcpclient.GetStream();
+        UnityEngine.Debug.Log("Connection is successful !!\n");
     }
 
     void byteLengthToFrameByteArray(int byteLength, byte[] fullBytes)
@@ -913,9 +791,10 @@ public class Client_driver : MonoBehaviour
         bool disconnected = false;
 
         byte[] PosBytesCount = new byte[size];
-        texClient.NoDelay = true;
-        texClient.ReceiveBufferSize = size;
-        NetworkStream tex_stream = texClient.GetStream();
+        tcpclient.NoDelay = true;
+        tcpclient.Client.NoDelay = true;
+        tcpclient.ReceiveBufferSize = size;
+        NetworkStream tex_stream = tcpclient.GetStream();
         var total = 0;
         do
         {
@@ -941,26 +820,30 @@ public class Client_driver : MonoBehaviour
 
         return byteLength;
     }
-    
-    void displayPos()
-    {
-        UnityEngine.Debug.LogFormat("Current position : {0},{1}", packet.pos.getX(), time);
-    }
+
     int frameByteArrayToByteLength(byte[] frameBytesLength)
     {
         int byteLength = BitConverter.ToInt32(frameBytesLength, 0);
         return byteLength;
     }
+    #endregion
 
     private void OnApplicationQuit()
     {
-        for(int i = 0; i < receiveLocks.Length; i++)
+        for (int i = 0; i < receiveLocks.Length; i++)
         {
             receiveThreads[i].Join();
         }
-
-        UnityEngine.Debug.LogWarningFormat("Avg end to end delay : {0:f3}", (e2eDelay / (double)client.pathlist.Length));
+        profiler.getSummary();
+        profiler.writeSummary();
+        profiler.writeDetail();
+        profiler.writeLabel();
+        //UnityEngine.Debug.LogWarningFormat("Avg Buffer Read time : {0:f3}", (double)sumOfBufferRead/ (double)client.pathlist.Length);
+        //UnityEngine.Debug.LogWarningFormat("Avg View Read time : {0:f3}", (double)sumOfViewRead/ (double)client.pathlist.Length);
+        //UnityEngine.Debug.LogWarningFormat("Avg end to end delay : {0:f3}", (e2eDelay / (double)client.pathlist.Length));
         //receiveThread.Join();
+        tcpclient.Close();
+        GC.Collect();
     }
 
     #region Convert struct to byte array

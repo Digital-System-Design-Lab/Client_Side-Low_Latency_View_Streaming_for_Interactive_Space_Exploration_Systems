@@ -1,0 +1,11 @@
+===============D e t a i l================
+ID	Region	Seg_X	Seg_Y	Pos_X	Pos_Y	HD	ESL	Stat	Frame Delay
+0	Column1	0	1	0	1	1	0	MISS	38.089
+1	Column1	0	1	0	2	1	0	HIT	1231.757
+2	Column1	0	1	0	3	1	0	HIT	34.410
+3	Column1	0	1	0	4	1	0	HIT	34.942
+4	Column1	0	1	0	5	1	0	HIT	34.949
+5	Column1	0	1	0	6	1	0	HIT	367.348
+6	Column1	0	1	0	7	1	0	HIT	250.288
+7	Column1	0	1	0	8	1	0	HIT	338.071
+8	Column1	0	1	0	9	1	0	HIT	216.333

@@ -324,4 +324,8 @@ public class XboxController : MonoBehaviour
         rotateMiniCam();
         switching_map(btn_X);
     }
+    private void OnApplicationQuit()
+    {
+        GC.Collect();
+    }
 }

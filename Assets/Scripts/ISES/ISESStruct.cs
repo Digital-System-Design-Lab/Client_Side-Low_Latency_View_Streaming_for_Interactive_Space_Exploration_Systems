@@ -76,12 +76,14 @@ namespace ISESStructure
         public Pos pos;
         public Qualitylist misslist; // from client
         public sub_segment_pos sub_seg_info;
+        public int isPredicted;
 
         public Request(Pos pos, Qualitylist misslist, sub_segment_pos sub_seg_info)
         {
             this.pos = pos;
             this.misslist = misslist;
             this.sub_seg_info = sub_seg_info;
+            this.isPredicted = 0;
         }
 
         public byte[] StructToBytes(object obj)

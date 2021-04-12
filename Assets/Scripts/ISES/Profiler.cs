@@ -120,6 +120,18 @@ namespace ISESProfiler
             _detail.Add(_deta);
         }
 
+        public void recording(List<Labelinfo> label_delay, Pos pos, out_cache_search result, Loc loc)
+        {
+            RequestPacket packet = new RequestPacket(pos, result, loc);
+            double total_delay = 0.0f;
+            for (int i = 0; i < label_delay.Count; i++)
+            {
+                total_delay += label_delay[i].getEnd2end();
+            }
+            Detail _deta = new Detail(packet, total_delay);
+            _detail.Add(_deta);
+        }
+
         // deed reckoning 전용 recording
         public void recording(RequestPacket packet, List<Labelinfo> label_delay, bool isPredict, bool isPartial)
         {

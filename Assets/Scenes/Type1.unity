@@ -806,6 +806,7 @@ GameObject:
   - component: {fileID: 1642810135}
   - component: {fileID: 1642810137}
   - component: {fileID: 1642810136}
+  - component: {fileID: 1642810138}
   m_Layer: 0
   m_Name: GameObject
   m_TagString: Untagged
@@ -839,10 +840,24 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 38f20456dc841dc4e97efdc546bd08b0, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  ContentServerIP: 165.246.39.163
+  ContentServerPort: 11000
   messageByteLength: 24
   Render_tex: {fileID: 1687029416}
   Equi: {fileID: 1397590516}
 --- !u!114 &1642810137
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1642810134}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: c795bb7e7f5ca2d4ca953fd684286ad8, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+--- !u!114 &1642810138
 MonoBehaviour:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
