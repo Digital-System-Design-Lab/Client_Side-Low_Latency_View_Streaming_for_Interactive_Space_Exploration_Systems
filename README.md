@@ -26,7 +26,7 @@ Data format is as follows
 To run this system. you have to edit **Assets/Scripts/client_driver.cs** file. You should open port number for network connection. And you should edit *ContentServerIP*, *ContentServerPort*.
 
 ```c#
-	public string ContentServerIP = "165.246.39.163";
+    public string ContentServerIP = "165.246.39.163";
     public int ContentServerPort = 11000;
 ```
 
