@@ -1,4 +1,4 @@
-# [Client-side] Low Latency View Streaming for Interactive Space Exploration
+# [Client-side] Low Latency View Streaming for Interactive Space Exploration Systems
 
 ## Description
 
